@@ -2,17 +2,18 @@
 market_patterns_robustness.py
 ====================================================
 RESEARCH OBJECTIVE:
-1. Address the "Regime Shift" issue (high VAL, weak TEST) by simplifying
-   selection and using a fixed top-decile trigger.
+1. Address the "Regime Shift" issue (high VAL, weak TEST) by controlling
+   threshold selection (train vs. val) and using fixed percentile triggers.
 2. Compare raw labels (TRAIN tertiles) vs. volatility-standardized labels
    with fixed thresholds.
-3. Test whether macro lookbacks (60/120/240) yield more stable test behavior.
+3. Test whether macro lookbacks (60/120/240, 30/120/240) yield more stable
+   test behavior.
 
 KEY DIFFERENCES FROM market_patterns_experiments.py
 - A/B targets: raw quantiles vs. vol-standardized targets.
 - Macro feature spec (60/120/240) added.
-- Selection simplified to a fixed percentile threshold on TEST
-  (no risk filter or species search) to reduce selection bias.
+- Thresholds are sourced from TRAIN or VAL score distributions, then applied
+  to TEST to limit leakage.
 ====================================================
 """
 
@@ -50,13 +51,18 @@ HORIZON = 60
 SAMPLE_STEP = 5
 DECISION_STEP = HORIZON
 
+TRAIN_FRAC = 0.70
+VAL_FRAC = 0.10
+
 TARGET_TYPES = ["raw_quantile", "vol_std"]
 
 VOL_STD_WINDOW = 60
 VOL_STD_THRESH = (-0.5, 0.5)
 
 COST_BPS = 1.0
-TOP_PCT = 90
+THRESH_PCTS = [90, 95, 97]
+MODES = ["long_only", "short_only", "long_short"]
+THRESH_SOURCES = ["train", "val"]
 
 
 @dataclass(frozen=True)
@@ -69,6 +75,7 @@ class FeatureSpec:
 FEATURE_SPECS = [
     FeatureSpec("core_30_60", (30, 60), ("drift_norm", "signflip", "logvol")),
     FeatureSpec("macro_60_240", (60, 120, 240), ("drift_norm", "signflip", "logvol")),
+    FeatureSpec("macro_30_120_240", (30, 120, 240), ("drift_norm", "signflip", "logvol")),
 ]
 
 
@@ -297,6 +304,29 @@ def labels_from_target(
     raise ValueError(f"Unknown target_type: {target_type}")
 
 
+def score_positions(score: np.ndarray, thr: float, mode: str) -> np.ndarray:
+    if mode == "long_only":
+        return (score > thr).astype(np.float32)
+    if mode == "short_only":
+        return -(score < -thr).astype(np.float32)
+    if mode == "long_short":
+        pos = np.zeros_like(score, dtype=np.float32)
+        pos[score > thr] = 1.0
+        pos[score < -thr] = -1.0
+        return pos
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def pnl_stats(pnl_bps: np.ndarray) -> Tuple[float, float, float, float]:
+    if len(pnl_bps) == 0:
+        return 0.0, 0.0, 0.0, 0.0
+    mu = float(pnl_bps.mean())
+    sd = float(pnl_bps.std(ddof=1)) if len(pnl_bps) > 1 else 0.0
+    t_stat = float(mu / (sd / math.sqrt(len(pnl_bps)) + 1e-12)) if len(pnl_bps) > 1 else 0.0
+    win_rate = float((pnl_bps > 0).mean())
+    return mu, sd, t_stat, win_rate
+
+
 # ============================
 # EXPERIMENT ENGINE
 # ============================
@@ -318,6 +348,10 @@ def run_pipeline() -> None:
             y_tr_list: List[np.ndarray] = []
             v_tr_list: List[np.ndarray] = []
 
+            X_va_list: List[np.ndarray] = []
+            y_va_list: List[np.ndarray] = []
+            v_va_list: List[np.ndarray] = []
+
             X_te_list: List[np.ndarray] = []
             y_te_list: List[np.ndarray] = []
             v_te_list: List[np.ndarray] = []
@@ -334,11 +368,26 @@ def run_pipeline() -> None:
                 if len(r1) < (Wmax + HORIZON + 2000):
                     continue
 
+                train_end = int(len(r1) * TRAIN_FRAC)
+                val_end = int(len(r1) * (TRAIN_FRAC + VAL_FRAC))
+
                 t_end_train = np.arange(
-                    Wmax - 1, len(r1) - HORIZON, SAMPLE_STEP, dtype=np.int64
+                    Wmax - 1, train_end - HORIZON, SAMPLE_STEP, dtype=np.int64
                 )
+                t_end_val = np.arange(
+                    max(Wmax - 1, train_end),
+                    val_end - HORIZON,
+                    DECISION_STEP,
+                    dtype=np.int64,
+                )
+
+                if len(t_end_train) == 0 or len(t_end_val) == 0:
+                    continue
+
                 Xtr, ytr, _ = build_Xy_for_times(r1, t_end_train, prefix1, HORIZON, spec)
                 vtr = vol_at_times(r1, t_end_train, VOL_STD_WINDOW)
+                Xva, yva, _ = build_Xy_for_times(r1, t_end_val, prefix1, HORIZON, spec)
+                vva = vol_at_times(r1, t_end_val, VOL_STD_WINDOW)
 
                 if len(Xtr) > 100_000:
                     idx = np.linspace(0, len(Xtr) - 1, 100_000).astype(int)
@@ -347,6 +396,10 @@ def run_pipeline() -> None:
                 X_tr_list.append(Xtr)
                 y_tr_list.append(ytr)
                 v_tr_list.append(vtr)
+
+                X_va_list.append(Xva)
+                y_va_list.append(yva)
+                v_va_list.append(vva)
 
                 if 2 in parts:
                     r2, _ = parts[2]
@@ -359,16 +412,18 @@ def run_pipeline() -> None:
                     )
                     vte = vol_at_times(r2, t_end_test, VOL_STD_WINDOW)
                 else:
-                    split = int(len(r1) * 0.8)
-                    r_tail = r1[split:]
-                    prefix_tail = make_prefix(r_tail)
                     t_end_test = np.arange(
-                        Wmax - 1, len(r_tail) - HORIZON, DECISION_STEP, dtype=np.int64
+                        max(Wmax - 1, val_end),
+                        len(r1) - HORIZON,
+                        DECISION_STEP,
+                        dtype=np.int64,
                     )
+                    if len(t_end_test) == 0:
+                        continue
                     Xte, yte, _ = build_Xy_for_times(
-                        r_tail, t_end_test, prefix_tail, HORIZON, spec
+                        r1, t_end_test, prefix1, HORIZON, spec
                     )
-                    vte = vol_at_times(r_tail, t_end_test, VOL_STD_WINDOW)
+                    vte = vol_at_times(r1, t_end_test, VOL_STD_WINDOW)
 
                 start_loc = sum(len(x) for x in X_te_list)
                 X_te_list.append(Xte)
@@ -376,7 +431,7 @@ def run_pipeline() -> None:
                 v_te_list.append(vte)
                 test_slices.append((asset, start_loc, start_loc + len(Xte)))
 
-            if not X_tr_list or not X_te_list:
+            if not X_tr_list or not X_va_list or not X_te_list:
                 print("  [SKIP] Not enough data after filtering.")
                 continue
 
@@ -384,17 +439,19 @@ def run_pipeline() -> None:
             y_tr_raw = np.concatenate(y_tr_list)
             v_tr = np.concatenate(v_tr_list)
 
+            X_va = np.concatenate(X_va_list)
+            y_va_raw = np.concatenate(y_va_list)
+            v_va = np.concatenate(v_va_list)
+
             X_te = np.concatenate(X_te_list)
             y_te_raw = np.concatenate(y_te_list)
             v_te = np.concatenate(v_te_list)
 
             labels_tr, thresh = labels_from_target(y_tr_raw, v_tr, target_type)
-            labels_te, _ = labels_from_target(
-                y_te_raw, v_te, target_type, train_quantiles=thresh
-            )
 
             scaler = StandardScaler()
             X_tr_s = scaler.fit_transform(X_tr)
+            X_va_s = scaler.transform(X_va)
             X_te_s = scaler.transform(X_te)
 
             clf = HistGradientBoostingClassifier(
@@ -402,59 +459,72 @@ def run_pipeline() -> None:
             )
             clf.fit(X_tr_s, labels_tr)
 
-            probs_te = clf.predict_proba(X_te_s)
-            scores_te = probs_te[:, 2] - probs_te[:, 0]
-            threshold = np.percentile(scores_te, TOP_PCT)
-            mask = scores_te > threshold
+            score_tr = clf.predict_proba(X_tr_s)
+            score_tr = score_tr[:, 2] - score_tr[:, 0]
+            score_va = clf.predict_proba(X_va_s)
+            score_va = score_va[:, 2] - score_va[:, 0]
+            score_te = clf.predict_proba(X_te_s)
+            score_te = score_te[:, 2] - score_te[:, 0]
 
-            selected_returns = y_te_raw[mask]
-            net_bps = (selected_returns * 10_000.0) - COST_BPS
+            for thresh_source in THRESH_SOURCES:
+                source_scores = score_tr if thresh_source == "train" else score_va
+                for pct in THRESH_PCTS:
+                    thr = float(np.percentile(source_scores, pct))
+                    for mode in MODES:
+                        pos = score_positions(score_te, thr, mode)
+                        traded = pos != 0
+                        pnl = (pos * y_te_raw) - traded.astype(np.float32) * (
+                            COST_BPS / 10_000.0
+                        )
+                        pnl_bps = pnl[traded] * 10_000.0
+                        mu, sd, t_stat, win_rate = pnl_stats(pnl_bps)
 
-            if len(net_bps) > 1:
-                mu = float(net_bps.mean())
-                sigma = float(net_bps.std(ddof=1))
-                t_stat = mu / (sigma / math.sqrt(len(net_bps)) + 1e-12)
-                win_rate = float((net_bps > 0).mean())
-            else:
-                mu = 0.0
-                t_stat = 0.0
-                win_rate = 0.0
+                        asset_ts = []
+                        for asset, start, end in test_slices:
+                            a_scores = score_te[start:end]
+                            a_y = y_te_raw[start:end]
+                            a_pos = score_positions(a_scores, thr, mode)
+                            a_traded = a_pos != 0
+                            if a_traded.sum() < 5:
+                                continue
+                            a_pnl = (a_pos[a_traded] * a_y[a_traded]) * 10_000.0 - COST_BPS
+                            if len(a_pnl) > 1:
+                                t = a_pnl.mean() / (
+                                    a_pnl.std(ddof=1) / math.sqrt(len(a_pnl)) + 1e-12
+                                )
+                                asset_ts.append(float(t))
 
-            asset_ts = []
-            for asset, start, end in test_slices:
-                a_scores = scores_te[start:end]
-                a_y = y_te_raw[start:end]
-                a_mask = a_scores > threshold
-                if a_mask.sum() < 5:
-                    continue
-                a_pnl = (a_y[a_mask] * 10_000.0) - COST_BPS
-                if len(a_pnl) > 1:
-                    t = a_pnl.mean() / (a_pnl.std(ddof=1) / math.sqrt(len(a_pnl)) + 1e-12)
-                    asset_ts.append(float(t))
+                        positive_assets = sum(1 for t in asset_ts if t > 0.5)
+                        print(
+                            "  "
+                            f"Source={thresh_source} | pct={pct} | mode={mode} | "
+                            f"Trades={len(pnl_bps)} | Mean={mu:.2f}bps | "
+                            f"T-Stat={t_stat:.2f} | Win%={win_rate * 100:.1f} | "
+                            f"Assets T>0.5: {positive_assets}/{len(asset_ts)}"
+                        )
 
-            positive_assets = sum(1 for t in asset_ts if t > 0.5)
-            print(
-                f"  Test Trades: {len(net_bps)} | Mean Bps: {mu:.2f} | "
-                f"T-Stat: {t_stat:.2f} | Win%: {win_rate * 100:.1f}"
-            )
-            print(f"  Assets with T>0.5: {positive_assets}/{len(asset_ts)}")
-
-            results.append(
-                dict(
-                    spec=spec.name,
-                    target=target_type,
-                    n_trades=len(net_bps),
-                    mean_bps=mu,
-                    t_stat=t_stat,
-                    win_rate=win_rate,
-                    thresh_used=thresh,
-                )
-            )
+                        results.append(
+                            dict(
+                                spec=spec.name,
+                                target=target_type,
+                                thresh_source=thresh_source,
+                                pct=pct,
+                                mode=mode,
+                                n_trades=len(pnl_bps),
+                                mean_bps=mu,
+                                t_stat=t_stat,
+                                win_rate=win_rate,
+                                positive_assets=positive_assets,
+                                label_thresh=thresh,
+                            )
+                        )
 
     print("\n================ FINAL COMPARISON ================")
     df = pd.DataFrame(results)
     if not df.empty:
-        print(df.sort_values("t_stat", ascending=False).to_string(index=False))
+        print(
+            df.sort_values(["t_stat", "mean_bps"], ascending=False).to_string(index=False)
+        )
         df.to_csv("robustness_results.csv", index=False)
         print("==================================================")
         print("Saved: robustness_results.csv")

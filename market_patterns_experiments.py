@@ -158,20 +158,22 @@ FB_TRAIN_FRAC = 0.60
 FB_VAL_FRAC = 0.10  # test is remainder
 
 # ---- Threshold selection / objectives ----
-SCORE_PCTS = [90, 92, 95, 96, 97, 98, 99]
+SCORE_PCTS = [95, 97, 99]
 MIN_TRADES_VAL = 200  # minimum trades required on VAL for a config to be considered
+MIN_POSITIVE_ASSETS_VAL = 4
+ASSET_T_CUTOFF = 0.5
 
 # We select configs on VAL by maximizing t-stat per trade.
 # (Alternative: maximize mean bps per trade with trade count constraint.)
 
 # ---- Costs to test (bps round-trip) ----
-COSTS_BPS = [0.5, 1.0, 2.0]
+COSTS_BPS = [1.0]
 
 # ---- Modes: long_only, short_only, long_short ----
-MODES = ["long_only", "short_only", "long_short"]
+MODES = ["long_only", "long_short"]
 
 # ---- Species (clusters) ----
-K_LIST = [None, 10, 20, 30, 50]  # None means no species gating
+K_LIST = [None, 10]  # None means no species gating
 MIN_CLUSTER_N_TRAIN = 2000
 TOP_M_CLUSTERS = 10
 MIN_SPECIES_COVERAGE_VAL = 0.05
@@ -185,9 +187,13 @@ RISK_FILTER_CANDIDATES = [
     ("logvol_60", "cap", [0.80, 0.85, 0.90, 0.95]),
     ("logvol_30", "cap", [0.80, 0.85, 0.90, 0.95]),
     ("logvol_15", "cap", [0.80, 0.85, 0.90, 0.95]),
+    ("logvol_120", "cap", [0.80, 0.85, 0.90, 0.95]),
+    ("logvol_240", "cap", [0.80, 0.85, 0.90, 0.95]),
     ("signflip_60", "floor", [0.50, 0.60, 0.70, 0.80]),
     ("signflip_30", "floor", [0.50, 0.60, 0.70, 0.80]),
     ("signflip_15", "floor", [0.50, 0.60, 0.70, 0.80]),
+    ("signflip_120", "floor", [0.50, 0.60, 0.70, 0.80]),
+    ("signflip_240", "floor", [0.50, 0.60, 0.70, 0.80]),
 ]
 # plus "None" risk filter implicitly.
 
@@ -217,36 +223,8 @@ class FeatureSpec:
 #   ac1: lag-1 autocorr in window
 
 FEATURE_SPECS = [
-    FeatureSpec("core_60", (60,), ("drift_norm", "signflip", "logvol")),
     FeatureSpec("core_30_60", (30, 60), ("drift_norm", "signflip", "logvol")),
-    FeatureSpec(
-        "core_15_30_60",
-        (15, 30, 60),
-        ("drift_norm", "signflip", "logvol"),
-    ),  # current default
-    FeatureSpec(
-        "core+abs_15_30_60",
-        (15, 30, 60),
-        ("drift_norm", "signflip", "logvol", "mean_abs"),
-    ),
-    FeatureSpec(
-        "ext_15_30_60",
-        (15, 30, 60),
-        ("drift_norm", "signflip", "logvol", "mean_abs", "max_abs", "jump_rate"),
-    ),
-    FeatureSpec(
-        "ext+ac_15_30_60",
-        (15, 30, 60),
-        (
-            "drift_norm",
-            "signflip",
-            "logvol",
-            "mean_abs",
-            "max_abs",
-            "jump_rate",
-            "ac1",
-        ),
-    ),
+    FeatureSpec("macro_60_240", (60, 120, 240), ("drift_norm", "signflip", "logvol")),
 ]
 
 
@@ -759,6 +737,32 @@ def per_asset_trade_table(trade_rows: List[Dict[str, float]]) -> pd.DataFrame:
     return out.sort_values("mean", ascending=False)
 
 
+def count_positive_assets(
+    asset_splits: List["AssetSplit"],
+    clf: HistGradientBoostingClassifier,
+    scaler: StandardScaler,
+    mode: str,
+    thr: float,
+    cost_bps: float,
+    species_gate: Optional["SpeciesGate"],
+    risk: Optional[Tuple[str, str, float]],
+    feat_index: Dict[str, int],
+    split_attr: str,
+    t_cutoff: float,
+) -> int:
+    positive = 0
+    for split in asset_splits:
+        Xd = getattr(split, split_attr)
+        yd = getattr(split, split_attr.replace("X", "y"))
+        pnl_bps, _ = evaluate_split_trading(
+            clf, scaler, Xd, yd, mode, thr, cost_bps, species_gate, risk, feat_index
+        )
+        stats = trade_stats(pnl_bps)
+        if stats["trades"] > 0 and stats["t"] > t_cutoff:
+            positive += 1
+    return positive
+
+
 def make_feat_index(feat_names: List[str]) -> Dict[str, int]:
     """
     feat_names are like 'logvol_60' etc. Return mapping -> column index.
@@ -893,9 +897,30 @@ def run_one_pipeline(
                 feat_index,
             )
             if st_val["trades"] >= MIN_TRADES_VAL:
-                key = st_val["t"]
-                if (best is None) or (key > best["val"]["t"]):
-                    best = dict(mode=mode, pct=pct, thr=thr, risk=None, val=st_val)
+                positive_assets = count_positive_assets(
+                    asset_splits,
+                    clf,
+                    scaler,
+                    mode,
+                    thr,
+                    cost_bps,
+                    species_gate,
+                    None,
+                    feat_index,
+                    "Xva_d",
+                    ASSET_T_CUTOFF,
+                )
+                if positive_assets >= MIN_POSITIVE_ASSETS_VAL:
+                    key = st_val["t"]
+                    if (best is None) or (key > best["val"]["t"]):
+                        best = dict(
+                            mode=mode,
+                            pct=pct,
+                            thr=thr,
+                            risk=None,
+                            val=st_val,
+                            val_positive_assets=positive_assets,
+                        )
 
             # Option 1..N: risk filters (cutoff computed on VAL among base-enter set)
             for fname, direction, qs in RISK_FILTER_CANDIDATES:
@@ -921,10 +946,30 @@ def run_one_pipeline(
                     )
                     if st_val2["trades"] < MIN_TRADES_VAL:
                         continue
+                    positive_assets = count_positive_assets(
+                        asset_splits,
+                        clf,
+                        scaler,
+                        mode,
+                        thr,
+                        cost_bps,
+                        species_gate,
+                        (fname, direction, float(cut)),
+                        feat_index,
+                        "Xva_d",
+                        ASSET_T_CUTOFF,
+                    )
+                    if positive_assets < MIN_POSITIVE_ASSETS_VAL:
+                        continue
                     key = st_val2["t"]
                     if (best is None) or (key > best["val"]["t"]):
                         best = dict(
-                            mode=mode, pct=pct, thr=thr, risk=(fname, direction, q, cut), val=st_val2
+                            mode=mode,
+                            pct=pct,
+                            thr=thr,
+                            risk=(fname, direction, q, cut),
+                            val=st_val2,
+                            val_positive_assets=positive_assets,
                         )
 
     if best is None:
@@ -1168,6 +1213,7 @@ def main() -> None:
                             if best["risk"] is None
                             else f"{best['risk'][0]}:{best['risk'][1]}@q{best['risk'][2]}"
                         ),
+                        val_positive_assets=best.get("val_positive_assets", 0),
                         val_trades=st["val_trades"],
                         val_mean=st["val_mean"],
                         val_t=st["val_t"],
@@ -1244,6 +1290,7 @@ def main() -> None:
         "val_trades",
         "val_mean",
         "val_t",
+        "val_positive_assets",
         "test_trades",
         "test_mean",
         "test_t",
